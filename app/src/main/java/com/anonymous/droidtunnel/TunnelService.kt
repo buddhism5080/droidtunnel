@@ -13,15 +13,18 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.IOException
+import java.util.ArrayDeque
 
 class TunnelService : Service() {
     private var process: Process? = null
+    private var logThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
                 val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
                 if (token.isBlank()) {
+                    appendLog("Token 为空，未启动")
                     return START_NOT_STICKY
                 }
                 startForeground(NOTIFICATION_ID, buildNotification())
@@ -54,8 +57,14 @@ class TunnelService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startTunnel(token: String) {
-        stopTunnel()
-        val binaryFile = prepareBinary() ?: return
+        stopTunnel(false)
+        appendLog("准备启动隧道")
+        val binaryFile = prepareBinary()
+        if (binaryFile == null) {
+            appendLog("未找到可执行文件")
+            stopSelf()
+            return
+        }
         try {
             process = ProcessBuilder(
                 binaryFile.absolutePath,
@@ -67,16 +76,42 @@ class TunnelService : Service() {
             ).redirectErrorStream(true)
                 .start()
             isRunning = true
+            appendLog("隧道已启动")
+            process?.let { startLogReader(it) }
         } catch (e: IOException) {
+            appendLog("启动失败: ${e.message}")
             isRunning = false
             stopSelf()
         }
     }
 
-    private fun stopTunnel() {
+    private fun stopTunnel(log: Boolean = true) {
         process?.destroy()
         process = null
+        logThread?.interrupt()
+        logThread = null
         isRunning = false
+        if (log) {
+            appendLog("已停止隧道")
+        }
+    }
+
+    private fun startLogReader(process: Process) {
+        logThread?.interrupt()
+        logThread = Thread {
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line -> appendLog(line) }
+                }
+            } catch (e: IOException) {
+                appendLog("读取日志失败: ${e.message}")
+            } finally {
+                appendLog("隧道进程已退出")
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
     }
 
     private fun prepareBinary(): File? {
@@ -90,10 +125,36 @@ class TunnelService : Service() {
                 }
             }
             outputFile.setExecutable(true, true)
+            appendLog("已释放可执行文件: ${outputFile.absolutePath}")
             outputFile
         } catch (e: IOException) {
+            appendLog("释放失败: ${e.message}")
             null
         }
+    }
+
+    private fun appendLog(message: String) {
+        val trimmed = message.trim()
+        if (trimmed.isEmpty()) {
+            return
+        }
+        val safeLine = if (trimmed.length > MAX_LOG_LINE_LENGTH) {
+            trimmed.take(MAX_LOG_LINE_LENGTH) + "…"
+        } else {
+            trimmed
+        }
+        val snapshot = synchronized(logBuffer) {
+            logBuffer.addLast(safeLine)
+            while (logBuffer.size > MAX_LOG_LINES) {
+                logBuffer.removeFirst()
+            }
+            logBuffer.joinToString("\n")
+        }
+        val intent = Intent(ACTION_LOG).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_LOGS, snapshot)
+        }
+        sendBroadcast(intent)
     }
 
     private fun buildNotification(): Notification {
@@ -139,9 +200,14 @@ class TunnelService : Service() {
         private const val ACTION_START = "com.anonymous.droidtunnel.START"
         private const val ACTION_STOP = "com.anonymous.droidtunnel.STOP"
         private const val EXTRA_TOKEN = "extra_token"
+        const val ACTION_LOG = "com.anonymous.droidtunnel.LOG"
+        const val EXTRA_LOGS = "extra_logs"
         private const val NOTIFICATION_CHANNEL_ID = "tunnel"
         private const val NOTIFICATION_ID = 1001
         private val SUPPORTED_ABIS = listOf("arm64-v8a", "armeabi-v7a")
+        private const val MAX_LOG_LINES = 200
+        private const val MAX_LOG_LINE_LENGTH = 500
+        private val logBuffer: ArrayDeque<String> = ArrayDeque()
 
         @Volatile
         var isRunning: Boolean = false
@@ -160,6 +226,12 @@ class TunnelService : Service() {
                 action = ACTION_STOP
             }
             context.startService(intent)
+        }
+
+        fun getLogSnapshot(): String {
+            synchronized(logBuffer) {
+                return logBuffer.joinToString("\n")
+            }
         }
     }
 }
