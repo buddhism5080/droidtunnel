@@ -7,8 +7,12 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.os.Build
+import android.net.ConnectivityManager
+import android.net.Network
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.io.File
@@ -18,10 +22,40 @@ import java.util.ArrayDeque
 class TunnelService : Service() {
     private var process: Process? = null
     private var logThread: Thread? = null
+    private var userStopped = false
+    private var ignoreNextExit = false
+    private var lastRestartAt = 0L
+    private var pendingRestartReason = ""
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var connectivityManager: ConnectivityManager
+
+    private val restartRunnable = Runnable {
+        performRestart(pendingRestartReason)
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            appendLog("网络已连接")
+            scheduleRestart("网络可用")
+        }
+
+        override fun onLost(network: Network) {
+            appendLog("网络已断开")
+            scheduleRestart("网络变动")
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager.registerDefaultNetworkCallback(networkCallback)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                userStopped = false
+                handler.removeCallbacks(restartRunnable)
                 val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
                 if (token.isBlank()) {
                     appendLog("Token 为空，未启动")
@@ -32,12 +66,15 @@ class TunnelService : Service() {
                 return START_STICKY
             }
             ACTION_STOP -> {
-                stopTunnel()
+                userStopped = true
+                handler.removeCallbacks(restartRunnable)
+                stopTunnel(ignoreExit = true)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
             else -> {
+                userStopped = false
                 val savedToken = readSavedToken()
                 if (savedToken.isNotBlank()) {
                     startForeground(NOTIFICATION_ID, buildNotification())
@@ -50,14 +87,16 @@ class TunnelService : Service() {
     }
 
     override fun onDestroy() {
-        stopTunnel()
+        handler.removeCallbacks(restartRunnable)
+        connectivityManager.unregisterNetworkCallback(networkCallback)
+        stopTunnel(ignoreExit = true)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun startTunnel(token: String) {
-        stopTunnel(false)
+        stopTunnel(log = false, ignoreExit = true)
         appendLog("准备启动隧道")
         val binaryFile = prepareBinary()
         if (binaryFile == null) {
@@ -81,11 +120,15 @@ class TunnelService : Service() {
         } catch (e: IOException) {
             appendLog("启动失败: ${e.message}")
             isRunning = false
-            stopSelf()
+            scheduleRestart("启动失败")
         }
     }
 
-    private fun stopTunnel(log: Boolean = true) {
+    private fun stopTunnel(log: Boolean = true, ignoreExit: Boolean = false) {
+        val hadProcess = process != null
+        if (ignoreExit && hadProcess) {
+            ignoreNextExit = true
+        }
         process?.destroy()
         process = null
         logThread?.interrupt()
@@ -106,12 +149,52 @@ class TunnelService : Service() {
             } catch (e: IOException) {
                 appendLog("读取日志失败: ${e.message}")
             } finally {
-                appendLog("隧道进程已退出")
+                if (ignoreNextExit) {
+                    ignoreNextExit = false
+                    appendLog("隧道进程已退出(主动停止)")
+                } else {
+                    appendLog("隧道进程已退出")
+                    if (!userStopped) {
+                        scheduleRestart("进程退出")
+                    }
+                }
             }
         }.apply {
             isDaemon = true
             start()
         }
+    }
+
+    private fun scheduleRestart(reason: String) {
+        if (userStopped) {
+            appendLog("已忽略重连: 用户已停止")
+            return
+        }
+        pendingRestartReason = reason
+        val now = SystemClock.elapsedRealtime()
+        val since = now - lastRestartAt
+        val delay = if (since < MIN_RESTART_INTERVAL_MS) {
+            MIN_RESTART_INTERVAL_MS - since
+        } else {
+            RESTART_DELAY_MS
+        }
+        handler.removeCallbacks(restartRunnable)
+        handler.postDelayed(restartRunnable, delay)
+        appendLog("计划重连: $reason")
+    }
+
+    private fun performRestart(reason: String) {
+        if (userStopped) {
+            return
+        }
+        val token = readSavedToken()
+        if (token.isBlank()) {
+            appendLog("重连失败: token为空")
+            return
+        }
+        lastRestartAt = SystemClock.elapsedRealtime()
+        appendLog("执行重连: $reason")
+        startTunnel(token)
     }
 
     private fun prepareBinary(): File? {
@@ -172,16 +255,14 @@ class TunnelService : Service() {
     }
 
     private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
-                val channel = NotificationChannel(
-                    NOTIFICATION_CHANNEL_ID,
-                    getString(R.string.notification_channel),
-                    NotificationManager.IMPORTANCE_LOW
-                )
-                manager.createNotificationChannel(channel)
-            }
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                getString(R.string.notification_channel),
+                NotificationManager.IMPORTANCE_LOW
+            )
+            manager.createNotificationChannel(channel)
         }
     }
 
@@ -203,6 +284,8 @@ class TunnelService : Service() {
         private const val NATIVE_BINARY_NAME = "libcloudflared.so"
         private const val MAX_LOG_LINES = 200
         private const val MAX_LOG_LINE_LENGTH = 500
+        private const val RESTART_DELAY_MS = 2000L
+        private const val MIN_RESTART_INTERVAL_MS = 5000L
         private val logBuffer: ArrayDeque<String> = ArrayDeque()
 
         @Volatile
