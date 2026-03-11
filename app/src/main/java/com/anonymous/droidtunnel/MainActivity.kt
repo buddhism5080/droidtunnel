@@ -1,6 +1,9 @@
 package com.anonymous.droidtunnel
 
 import android.content.BroadcastReceiver
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -25,6 +28,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var disconnectButton: Button
     private lateinit var logView: TextView
     private var receiverRegistered = false
+    private var notificationPermissionRequested = false
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -84,6 +88,7 @@ class MainActivity : AppCompatActivity() {
             TunnelService.stop(this)
         }
 
+        requestNotificationPermissionIfNeeded()
         requestIgnoreBatteryOptimizationsIfNeeded()
 
         if (savedToken.isNotBlank()) {
@@ -114,6 +119,23 @@ class MainActivity : AppCompatActivity() {
         super.onStop()
     }
 
+    companion object {
+        private const val REQUEST_NOTIFICATIONS = 1002
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return
+        }
+        if (notificationPermissionRequested) {
+            return
+        }
+        notificationPermissionRequested = true
+		
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+        }
+    }
     private fun requestIgnoreBatteryOptimizationsIfNeeded() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
@@ -122,5 +144,5 @@ class MainActivity : AppCompatActivity() {
             }
             startActivity(intent)
         }
-    }
+	  }
 }
