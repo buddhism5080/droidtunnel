@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -115,22 +114,18 @@ class TunnelService : Service() {
     }
 
     private fun prepareBinary(): File? {
-        val abi = SUPPORTED_ABIS.firstOrNull { Build.SUPPORTED_ABIS.contains(it) } ?: return null
-        val assetPath = "bin/$abi/cloudflared"
-        val outputFile = File(filesDir, "cloudflared-$abi")
-        return try {
-            assets.open(assetPath).use { input ->
-                outputFile.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
-            outputFile.setExecutable(true, true)
-            appendLog("已释放可执行文件: ${outputFile.absolutePath}")
-            outputFile
-        } catch (e: IOException) {
-            appendLog("释放失败: ${e.message}")
-            null
+        val nativeDir = applicationInfo.nativeLibraryDir
+        if (nativeDir.isNullOrBlank()) {
+            appendLog("nativeLibraryDir 不可用")
+            return null
         }
+        val binaryFile = File(nativeDir, NATIVE_BINARY_NAME)
+        if (!binaryFile.exists()) {
+            appendLog("未找到可执行文件: ${binaryFile.absolutePath}")
+            return null
+        }
+        appendLog("已定位可执行文件: ${binaryFile.absolutePath}")
+        return binaryFile
     }
 
     private fun appendLog(message: String) {
@@ -204,7 +199,7 @@ class TunnelService : Service() {
         const val EXTRA_LOGS = "extra_logs"
         private const val NOTIFICATION_CHANNEL_ID = "tunnel"
         private const val NOTIFICATION_ID = 1001
-        private val SUPPORTED_ABIS = listOf("arm64-v8a", "armeabi-v7a")
+        private const val NATIVE_BINARY_NAME = "libcloudflared.so"
         private const val MAX_LOG_LINES = 200
         private const val MAX_LOG_LINE_LENGTH = 500
         private val logBuffer: ArrayDeque<String> = ArrayDeque()

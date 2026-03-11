@@ -21,6 +21,11 @@ android {
         }
     }
 
+    packagingOptions {
+        doNotStrip "*/arm64-v8a/libcloudflared.so"
+        doNotStrip "*/armeabi-v7a/libcloudflared.so"
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
