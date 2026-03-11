@@ -33,4 +33,28 @@
         android:layout_height="wrap_content"
         android:text="@string/disconnect"
         android:layout_marginTop="8dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/log_title"
+        android:textSize="14sp"
+        android:layout_marginTop="16dp" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true"
+        android:layout_marginTop="8dp">
+
+        <TextView
+            android:id="@+id/logView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/log_placeholder"
+            android:textSize="12sp"
+            android:textIsSelectable="true"
+            android:typeface="monospace" />
+    </ScrollView>
 </LinearLayout>
