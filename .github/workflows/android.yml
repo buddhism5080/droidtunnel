@@ -22,7 +22,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: "8.2.2"
+          gradle-version: "8.2.1"
 
       - name: Build Debug and Release APKs
         run: gradle assembleDebug assembleRelease
