@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Droid Tunnel</string>
+    <string name="token_hint">Cloudflare Tunnel Token</string>
+    <string name="connect">连接</string>
+    <string name="disconnect">断开</string>
+    <string name="notification_channel">Tunnel</string>
+    <string name="notification_running">隧道已连接</string>
+    <string name="token_empty">请输入token</string>
+</resources>
