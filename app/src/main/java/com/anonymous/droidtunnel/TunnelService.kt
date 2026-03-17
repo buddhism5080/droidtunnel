@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.IOException
 import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 
 class TunnelService : Service() {
     private var process: Process? = null
@@ -104,17 +105,33 @@ class TunnelService : Service() {
             stopSelf()
             return
         }
+
+        val supportsIpv6Edge = canPingRegion1OverIpv6()
+        if (supportsIpv6Edge) {
+            appendLog("IPv6 可用，使用 --edge-ip-version 6")
+        } else {
+            appendLog("IPv6 不可用，使用默认 edge-ip-version")
+        }
+
         try {
-            process = ProcessBuilder(
+            val args = mutableListOf(
                 binaryFile.absolutePath,
                 "tunnel",
                 "--no-autoupdate",
                 "--protocol",
-                "http2",
+                "http2"
+            )
+            if (supportsIpv6Edge) {
+                args += listOf("--edge-ip-version", "6")
+            }
+            args += listOf(
                 "run",
                 "--token",
                 token
-            ).redirectErrorStream(true)
+            )
+
+            process = ProcessBuilder(args)
+                .redirectErrorStream(true)
                 .start()
             isRunning = true
             appendLog("隧道已启动")
@@ -123,6 +140,46 @@ class TunnelService : Service() {
             appendLog("启动失败: ${e.message}")
             isRunning = false
             scheduleRestart("启动失败")
+        }
+    }
+
+    private fun canPingRegion1OverIpv6(): Boolean {
+        // 目标：在每次创建 cloudflared 进程前，用 ping6 或 ping -6 探测是否能通过 IPv6
+        // ping 通 region1.v2.argotunnel.com。
+        // 注意：不同 Android/ROM 对 ping 选项支持不一致；因此按顺序尝试 ping6 与 ping -6。
+        // 任一命令返回 0 视为可达，否则视为不可达（回退到默认/IPv4）。
+        val host = "region1.v2.argotunnel.com"
+        val timeoutSec = 2L
+
+        val candidates = listOf(
+            listOf("ping6", "-c", "1", host),
+            listOf("ping", "-6", "-c", "1", host)
+        )
+
+        for (cmd in candidates) {
+            if (runProbeCommand(cmd, timeoutSec)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun runProbeCommand(cmd: List<String>, timeoutSec: Long): Boolean {
+        return try {
+            val probe = ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .start()
+
+            val finished = probe.waitFor(timeoutSec, TimeUnit.SECONDS)
+            if (!finished) {
+                probe.destroy()
+                return false
+            }
+            probe.exitValue() == 0
+        } catch (_: IOException) {
+            false
+        } catch (_: InterruptedException) {
+            false
         }
     }
 
