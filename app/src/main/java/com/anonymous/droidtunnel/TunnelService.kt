@@ -109,6 +109,8 @@ class TunnelService : Service() {
                 binaryFile.absolutePath,
                 "tunnel",
                 "--no-autoupdate",
+                "--protocol",
+                "http2",
                 "run",
                 "--token",
                 token
