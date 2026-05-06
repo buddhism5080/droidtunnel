@@ -1,5 +1,6 @@
 package com.anonymous.droidtunnel
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,251 +10,542 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
-import android.os.Handler
+import android.net.NetworkCapabilities
 import android.os.IBinder
-import android.os.Looper
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
-import java.util.ArrayDeque
+import java.net.HttpURLConnection
+import java.net.URL
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 class TunnelService : Service() {
-    private var process: Process? = null
-    private var logThread: Thread? = null
-    private var userStopped = false
-    private var ignoreNextExit = false
-    private var lastRestartAt = 0L
-    private var pendingRestartReason = ""
-    private val handler = Handler(Looper.getMainLooper())
-    private lateinit var connectivityManager: ConnectivityManager
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val restartPolicy = RestartPolicy()
+    private val processMutex = Mutex()
 
-    private val restartRunnable = Runnable {
-        performRestart(pendingRestartReason)
-    }
+    private lateinit var connectivityManager: ConnectivityManager
+    private lateinit var notificationManager: NotificationManager
+    private lateinit var alarmManager: AlarmManager
+
+    private var process: Process? = null
+    private var processGeneration: Long = 0L
+    private var logJob: Job? = null
+    private var exitWatcherJob: Job? = null
+    private var healthJob: Job? = null
+    private var restartJob: Job? = null
+    private var networkRecoveryJob: Job? = null
+    private var restartAttempt: Int = 0
+    private var notificationStarted = false
+    private var lastProcessOutputAtMillis: Long = 0L
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            appendLog("网络已连接")
-            scheduleRestart("网络可用")
+            onNetworkStateChanged("网络已可用")
         }
 
         override fun onLost(network: Network) {
-            appendLog("网络已断开")
-            scheduleRestart("网络变动")
+            onNetworkStateChanged("网络已断开")
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                onNetworkStateChanged("网络已验证")
+            }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
         connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        resetRuntimeState()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                userStopped = false
-                handler.removeCallbacks(restartRunnable)
-                val token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
-                if (token.isBlank()) {
-                    appendLog("Token 为空，未启动")
-                    return START_NOT_STICKY
+        val action = intent?.action ?: ACTION_ENSURE
+        when (action) {
+            ACTION_STOP -> {
+                handleUserStop()
+                return START_NOT_STICKY
+            }
+
+            ACTION_START,
+            ACTION_ENSURE,
+            -> {
+                val explicitToken = intent.getStringExtra(EXTRA_TOKEN).orEmpty().trim()
+                if (explicitToken.isNotBlank()) {
+                    TunnelPreferences.saveToken(this, explicitToken)
+                    TunnelPreferences.setDesiredRunning(this, true)
                 }
-                startForeground(NOTIFICATION_ID, buildNotification())
-                startTunnel(token)
+                ensureForeground()
+                serviceScope.launch {
+                    ensureTunnelRunning(
+                        reason = intent.getStringExtra(EXTRA_REASON).orEmpty().ifBlank {
+                            if (action == ACTION_START) "用户请求启动" else "守护唤醒"
+                        },
+                    )
+                }
                 return START_STICKY
             }
-            ACTION_STOP -> {
-                userStopped = true
-                handler.removeCallbacks(restartRunnable)
-                stopTunnel(ignoreExit = true)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            else -> {
-                userStopped = false
-                val savedToken = readSavedToken()
-                if (savedToken.isNotBlank()) {
-                    startForeground(NOTIFICATION_ID, buildNotification())
-                    startTunnel(savedToken)
-                    return START_STICKY
-                }
-                return START_NOT_STICKY
-            }
+
+            else -> return START_STICKY
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (TunnelPreferences.readDesiredRunning(this) && TunnelPreferences.readToken(this).isNotBlank()) {
+            scheduleServiceWakeup(delayMs = 5_000L, reason = "任务移除后守护恢复")
         }
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(restartRunnable)
-        connectivityManager.unregisterNetworkCallback(networkCallback)
-        stopTunnel(ignoreExit = true)
+        try {
+            connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {
+        }
+        restartJob?.cancel()
+        healthJob?.cancel()
+        exitWatcherJob?.cancel()
+        logJob?.cancel()
+        networkRecoveryJob?.cancel()
+        runCatching {
+            process?.destroy()
+        }
+        process = null
+        notificationStarted = false
+        serviceScope.cancel()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startTunnel(token: String) {
-        stopTunnel(log = false, ignoreExit = true)
-        appendLog("准备启动隧道")
-        val binaryFile = prepareBinary()
-        if (binaryFile == null) {
-            appendLog("未找到可执行文件")
+    private fun handleUserStop() {
+        TunnelPreferences.setDesiredRunning(this, false)
+        appendLog("用户请求停止隧道")
+        serviceScope.launch {
+            processMutex.withLock {
+                stopCurrentProcess(reason = "用户已停止", clearDesiredRunning = true)
+            }
+            updateRuntimeState {
+                it.copy(
+                    desiredRunning = false,
+                    status = TunnelStatus.STOPPED,
+                    statusMessage = "已停止",
+                    nextRestartAtMillis = null,
+                )
+            }
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            notificationStarted = false
             stopSelf()
+        }
+    }
+
+    private suspend fun ensureTunnelRunning(reason: String) {
+        processMutex.withLock {
+            val token = TunnelPreferences.readToken(this)
+            val desiredRunning = TunnelPreferences.readDesiredRunning(this)
+            if (!desiredRunning) {
+                updateRuntimeState {
+                    it.copy(
+                        desiredRunning = false,
+                        status = TunnelStatus.STOPPED,
+                        statusMessage = "已停止",
+                    )
+                }
+                return
+            }
+
+            if (token.isBlank()) {
+                appendLog("未检测到 Cloudflare Tunnel Token，无法启动")
+                updateRuntimeState {
+                    it.copy(
+                        desiredRunning = true,
+                        status = TunnelStatus.ERROR,
+                        statusMessage = "缺少 Tunnel Token",
+                    )
+                }
+                return
+            }
+
+            if (process?.isAlive == true) {
+                appendLog("收到守护请求：$reason")
+                if (runtimeState.value.status == TunnelStatus.DEGRADED) {
+                    serviceScope.launch { performSingleHealthCheck("守护触发补检") }
+                }
+                return
+            }
+
+            launchTunnel(token = token, reason = reason)
+        }
+    }
+
+    private suspend fun launchTunnel(token: String, reason: String) {
+        restartJob?.cancel()
+        val binaryFile = prepareBinary() ?: run {
+            updateRuntimeState {
+                it.copy(
+                    desiredRunning = TunnelPreferences.readDesiredRunning(this),
+                    status = TunnelStatus.ERROR,
+                    statusMessage = "cloudflared 二进制不可用",
+                )
+            }
             return
         }
 
-        val supportsIpv6Edge = canPingRegion1OverIpv6()
-        if (supportsIpv6Edge) {
-            appendLog("IPv6 可用，使用 --edge-ip-version 6")
-        } else {
-            appendLog("IPv6 不可用，使用默认 edge-ip-version")
-        }
-
-        try {
-            val args = mutableListOf(
-                binaryFile.absolutePath,
-                "tunnel",
-                "--no-autoupdate",
-                "--protocol",
-                "http2"
-            )
-            if (supportsIpv6Edge) {
-                args += listOf("--edge-ip-version", "6")
-            }
-            args += listOf(
-                "run",
-                "--token",
-                token
-            )
-
-            process = ProcessBuilder(args)
-                .redirectErrorStream(true)
-                .start()
-            isRunning = true
-            appendLog("隧道已启动")
-            process?.let { startLogReader(it) }
-        } catch (e: IOException) {
-            appendLog("启动失败: ${e.message}")
-            isRunning = false
-            scheduleRestart("启动失败")
-        }
-    }
-
-    private fun canPingRegion1OverIpv6(): Boolean {
-        // 目标：在每次创建 cloudflared 进程前，用 ping6 或 ping -6 探测是否能通过 IPv6
-        // ping 通 region1.v2.argotunnel.com。
-        // 注意：不同 Android/ROM 对 ping 选项支持不一致；因此按顺序尝试 ping6 与 ping -6。
-        // 任一命令返回 0 视为可达，否则视为不可达（回退到默认/IPv4）。
-        val host = "region1.v2.argotunnel.com"
-        val timeoutSec = 2L
-
-        val candidates = listOf(
-            listOf("ping6", "-c", "1", host),
-            listOf("ping", "-6", "-c", "1", host)
+        stopCurrentProcess(reason = "切换到新的隧道进程", clearDesiredRunning = false)
+        val args = buildCommand(binaryFile, token)
+        appendLog("准备启动 cloudflared：$reason")
+        appendLog(
+            args.joinToString(separator = " ") { value ->
+                if (value == token) "<redacted-token>" else value
+            },
         )
 
-        for (cmd in candidates) {
-            if (runProbeCommand(cmd, timeoutSec)) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun runProbeCommand(cmd: List<String>, timeoutSec: Long): Boolean {
-        return try {
-            val probe = ProcessBuilder(cmd)
+        try {
+            val startedProcess = ProcessBuilder(args)
                 .redirectErrorStream(true)
                 .start()
+            process = startedProcess
+            processGeneration += 1L
+            val generation = processGeneration
+            lastProcessOutputAtMillis = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
 
-            val finished = probe.waitFor(timeoutSec, TimeUnit.SECONDS)
-            if (!finished) {
-                probe.destroy()
-                return false
+            updateRuntimeState {
+                it.copy(
+                    desiredRunning = true,
+                    status = TunnelStatus.STARTING,
+                    statusMessage = "正在与 Cloudflare Edge 建立连接",
+                    readyConnections = 0,
+                    consecutiveProbeFailures = 0,
+                    lastStartedAtMillis = now,
+                    nextRestartAtMillis = null,
+                    binaryPath = binaryFile.absolutePath,
+                )
             }
-            probe.exitValue() == 0
-        } catch (_: IOException) {
-            false
-        } catch (_: InterruptedException) {
-            false
+            refreshNotification()
+
+            startLogReader(generation, startedProcess)
+            startExitWatcher(generation, startedProcess)
+            startHealthLoop(generation)
+        } catch (e: IOException) {
+            appendLog("启动失败：${e.message.orEmpty()}")
+            updateRuntimeState {
+                it.copy(
+                    desiredRunning = true,
+                    status = TunnelStatus.ERROR,
+                    statusMessage = "启动失败：${e.message.orEmpty()}",
+                )
+            }
+            scheduleRestart(reason = "cloudflared 启动失败", authFailure = false, stopProcessFirst = false)
         }
     }
 
-    private fun stopTunnel(log: Boolean = true, ignoreExit: Boolean = false) {
-        val hadProcess = process != null
-        if (ignoreExit && hadProcess) {
-            ignoreNextExit = true
+    private fun buildCommand(binaryFile: File, token: String): List<String> {
+        val args = mutableListOf(
+            binaryFile.absolutePath,
+            "tunnel",
+            "--no-autoupdate",
+            "--protocol",
+            "http2",
+        )
+
+        if (canPingRegion1OverIpv6()) {
+            appendLog("IPv6 探测通过，优先使用 IPv6 Edge")
+            args += listOf("--edge-ip-version", "6")
+        } else {
+            appendLog("IPv6 不可达，保持 cloudflared 默认 Edge 策略")
         }
-        process?.destroy()
-        process = null
-        logThread?.interrupt()
-        logThread = null
-        isRunning = false
-        if (log) {
-            appendLog("已停止隧道")
-        }
+
+        args += listOf(
+            "--metrics",
+            METRICS_ENDPOINT,
+            "run",
+            "--token",
+            token,
+        )
+        return args
     }
 
-    private fun startLogReader(process: Process) {
-        logThread?.interrupt()
-        logThread = Thread {
+    private fun startLogReader(generation: Long, process: Process) {
+        logJob?.cancel()
+        logJob = serviceScope.launch {
             try {
                 process.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line -> appendLog(line) }
+                    lines.forEach { line ->
+                        if (!isActive || generation != processGeneration) {
+                            return@forEach
+                        }
+                        lastProcessOutputAtMillis = System.currentTimeMillis()
+                        appendLog(line)
+                    }
                 }
             } catch (e: IOException) {
-                appendLog("读取日志失败: ${e.message}")
-            } finally {
-                if (ignoreNextExit) {
-                    ignoreNextExit = false
-                    appendLog("隧道进程已退出(主动停止)")
+                appendLog("读取进程日志失败：${e.message.orEmpty()}")
+            }
+        }
+    }
+
+    private fun startExitWatcher(generation: Long, process: Process) {
+        exitWatcherJob?.cancel()
+        exitWatcherJob = serviceScope.launch {
+            val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
+            if (generation != processGeneration) {
+                return@launch
+            }
+
+            appendLog("隧道进程退出，exitCode=$exitCode")
+            updateRuntimeState {
+                it.copy(
+                    readyConnections = 0,
+                    consecutiveProbeFailures = 0,
+                    lastExitReason = "进程退出，exitCode=$exitCode",
+                    status = if (TunnelPreferences.readDesiredRunning(this@TunnelService)) {
+                        TunnelStatus.DEGRADED
+                    } else {
+                        TunnelStatus.STOPPED
+                    },
+                    statusMessage = if (TunnelPreferences.readDesiredRunning(this@TunnelService)) {
+                        "隧道意外退出，准备恢复"
+                    } else {
+                        "已停止"
+                    },
+                )
+            }
+            refreshNotification()
+            processMutex.withLock {
+                process = null
+                logJob?.cancel()
+                healthJob?.cancel()
+                if (TunnelPreferences.readDesiredRunning(this@TunnelService)) {
+                    scheduleRestart(reason = "cloudflared 进程退出", authFailure = false, stopProcessFirst = false)
+                }
+            }
+        }
+    }
+
+    private fun startHealthLoop(generation: Long) {
+        healthJob?.cancel()
+        healthJob = serviceScope.launch {
+            delay(HEALTH_STARTUP_GRACE_MS)
+            while (isActive && generation == processGeneration && TunnelPreferences.readDesiredRunning(this@TunnelService)) {
+                val shouldContinue = performSingleHealthCheck(reason = "定时巡检")
+                if (!shouldContinue) {
+                    return@launch
+                }
+
+                val probeFailures = runtimeState.value.consecutiveProbeFailures
+                val interval = if (probeFailures == 0) {
+                    HEALTHY_PROBE_INTERVAL_MS
                 } else {
-                    appendLog("隧道进程已退出")
-                    if (!userStopped) {
-                        scheduleRestart("进程退出")
+                    DEGRADED_PROBE_INTERVAL_MS
+                }
+                delay(interval)
+            }
+        }
+    }
+
+    private suspend fun performSingleHealthCheck(reason: String): Boolean {
+        val currentProcess = process
+        if (currentProcess == null || !currentProcess.isAlive) {
+            scheduleRestart(reason = "$reason：检测到进程不存在", authFailure = false, stopProcessFirst = false)
+            return false
+        }
+
+        val result = probeReadiness()
+        val now = System.currentTimeMillis()
+        if (result.ready) {
+            restartAttempt = 0
+            updateRuntimeState {
+                it.copy(
+                    desiredRunning = true,
+                    status = TunnelStatus.HEALTHY,
+                    statusMessage = "Tunnel 可用，readyConnections=${result.readyConnections}",
+                    readyConnections = result.readyConnections,
+                    consecutiveProbeFailures = 0,
+                    lastHealthyAtMillis = now,
+                    nextRestartAtMillis = null,
+                )
+            }
+            refreshNotification()
+            return true
+        }
+
+        val newFailures = runtimeState.value.consecutiveProbeFailures + 1
+        updateRuntimeState {
+            it.copy(
+                desiredRunning = true,
+                status = TunnelStatus.DEGRADED,
+                statusMessage = "健康检查失败：${result.summary}",
+                readyConnections = 0,
+                consecutiveProbeFailures = newFailures,
+            )
+        }
+        refreshNotification()
+
+        if (newFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) {
+            appendLog("连续 $newFailures 次健康检查失败，准备重启隧道")
+            scheduleRestart(
+                reason = "$reason：健康检查连续失败",
+                authFailure = false,
+                stopProcessFirst = true,
+            )
+            return false
+        }
+
+        val silenceDuration = now - lastProcessOutputAtMillis
+        if (silenceDuration >= MAX_PROCESS_SILENCE_MS) {
+            appendLog("进程长时间无输出（${silenceDuration / 1000}s），主动重启")
+            scheduleRestart(
+                reason = "$reason：进程长时间无输出",
+                authFailure = false,
+                stopProcessFirst = true,
+            )
+            return false
+        }
+
+        return true
+    }
+
+    private fun scheduleRestart(
+        reason: String,
+        authFailure: Boolean,
+        stopProcessFirst: Boolean,
+    ) {
+        if (!TunnelPreferences.readDesiredRunning(this)) {
+            appendLog("忽略重启：当前不要求保持运行")
+            return
+        }
+
+        serviceScope.launch {
+            processMutex.withLock {
+                if (stopProcessFirst) {
+                    stopCurrentProcess(reason = "准备重启：$reason", clearDesiredRunning = false)
+                }
+
+                restartJob?.cancel()
+                val baseDelay = restartPolicy.nextBaseDelayMs(
+                    attempt = restartAttempt,
+                    authFailure = authFailure,
+                )
+                val delayMs = restartPolicy.applyJitter(
+                    baseDelayMs = baseDelay,
+                    randomFactor = Random.nextDouble(),
+                )
+                val nextRestartAtMillis = System.currentTimeMillis() + delayMs
+                restartAttempt += 1
+
+                updateRuntimeState {
+                    it.copy(
+                        desiredRunning = true,
+                        status = TunnelStatus.RESTARTING,
+                        statusMessage = "正在安排重连：$reason",
+                        nextRestartAtMillis = nextRestartAtMillis,
+                        lastExitReason = reason,
+                        restartCount = it.restartCount + 1,
+                    )
+                }
+                refreshNotification()
+                appendLog("将在 ${delayMs / 1000.0} 秒后重连：$reason")
+
+                restartJob = serviceScope.launch {
+                    delay(delayMs)
+                    processMutex.withLock {
+                        val token = TunnelPreferences.readToken(this@TunnelService)
+                        if (!TunnelPreferences.readDesiredRunning(this@TunnelService) || token.isBlank()) {
+                            appendLog("取消重连：Token 或目标状态不可用")
+                            return@withLock
+                        }
+                        launchTunnel(token = token, reason = "自动恢复：$reason")
                     }
                 }
             }
-        }.apply {
-            isDaemon = true
-            start()
         }
     }
 
-    private fun scheduleRestart(reason: String) {
-        if (userStopped) {
-            appendLog("已忽略重连: 用户已停止")
-            return
+    private suspend fun stopCurrentProcess(
+        reason: String,
+        clearDesiredRunning: Boolean,
+    ) {
+        restartJob?.cancel()
+        healthJob?.cancel()
+        exitWatcherJob?.cancel()
+        logJob?.cancel()
+
+        val currentProcess = process
+        process = null
+        if (clearDesiredRunning) {
+            TunnelPreferences.setDesiredRunning(this, false)
         }
-        pendingRestartReason = reason
-        val now = SystemClock.elapsedRealtime()
-        val since = now - lastRestartAt
-        val delay = if (since < MIN_RESTART_INTERVAL_MS) {
-            MIN_RESTART_INTERVAL_MS - since
-        } else {
-            RESTART_DELAY_MS
+
+        if (currentProcess != null) {
+            runCatching {
+                currentProcess.destroy()
+                if (!currentProcess.waitFor(1_200L, TimeUnit.MILLISECONDS)) {
+                    currentProcess.destroyForcibly()
+                }
+            }
         }
-        handler.removeCallbacks(restartRunnable)
-        handler.postDelayed(restartRunnable, delay)
-        appendLog("计划重连: $reason")
+
+        updateRuntimeState {
+            it.copy(
+                desiredRunning = if (clearDesiredRunning) false else TunnelPreferences.readDesiredRunning(this),
+                readyConnections = 0,
+                consecutiveProbeFailures = 0,
+                nextRestartAtMillis = null,
+                lastExitReason = reason,
+            )
+        }
+        refreshNotification()
     }
 
-    private fun performRestart(reason: String) {
-        if (userStopped) {
+    private fun onNetworkStateChanged(reason: String) {
+        appendLog(reason)
+        if (!TunnelPreferences.readDesiredRunning(this)) {
             return
         }
-        val token = readSavedToken()
-        if (token.isBlank()) {
-            appendLog("重连失败: token为空")
-            return
+
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = serviceScope.launch {
+            delay(NETWORK_EVENT_DEBOUNCE_MS)
+            processMutex.withLock {
+                val currentProcess = process
+                if (currentProcess == null || !currentProcess.isAlive) {
+                    appendLog("网络恢复后未发现活动进程，立即尝试恢复")
+                    val token = TunnelPreferences.readToken(this@TunnelService)
+                    if (token.isNotBlank()) {
+                        launchTunnel(token = token, reason = reason)
+                    }
+                    return@withLock
+                }
+            }
+            performSingleHealthCheck(reason = reason)
         }
-        lastRestartAt = SystemClock.elapsedRealtime()
-        appendLog("执行重连: $reason")
-        startTunnel(token)
     }
 
     private fun prepareBinary(): File? {
@@ -262,13 +554,141 @@ class TunnelService : Service() {
             appendLog("nativeLibraryDir 不可用")
             return null
         }
+
         val binaryFile = File(nativeDir, NATIVE_BINARY_NAME)
         if (!binaryFile.exists()) {
-            appendLog("未找到可执行文件: ${binaryFile.absolutePath}")
+            appendLog("未找到 cloudflared：${binaryFile.absolutePath}")
             return null
         }
-        appendLog("已定位可执行文件: ${binaryFile.absolutePath}")
+        if (binaryFile.length() < MIN_BINARY_SIZE_BYTES) {
+            appendLog("cloudflared 二进制尺寸异常，疑似占位文件：${binaryFile.length()} bytes")
+            return null
+        }
+
         return binaryFile
+    }
+
+    private fun probeReadiness(): HealthResult {
+        val connection = runCatching {
+            (URL(READY_URL).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 2_000
+                readTimeout = 2_000
+                useCaches = false
+            }
+        }.getOrElse {
+            return HealthResult(false, 0, "无法连接 readiness 端点")
+        }
+
+        return try {
+            val statusCode = connection.responseCode
+            val responseBody = (if (statusCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            })?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+            if (statusCode == HttpURLConnection.HTTP_OK) {
+                val json = JSONObject(responseBody)
+                val readyConnections = json.optInt("readyConnections", 0)
+                val ready = readyConnections > 0
+                if (ready) {
+                    HealthResult(true, readyConnections, "readyConnections=$readyConnections")
+                } else {
+                    HealthResult(false, readyConnections, "readyConnections=0")
+                }
+            } else {
+                HealthResult(false, 0, "HTTP $statusCode")
+            }
+        } catch (e: Exception) {
+            HealthResult(false, 0, e.message.orEmpty().ifBlank { "readiness 检查失败" })
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun canPingRegion1OverIpv6(): Boolean {
+        val candidates = listOf(
+            listOf("ping6", "-c", "1", IPV6_PROBE_HOST),
+            listOf("ping", "-6", "-c", "1", IPV6_PROBE_HOST),
+        )
+
+        return candidates.any { command -> runProbeCommand(command, 2L) }
+    }
+
+    private fun runProbeCommand(command: List<String>, timeoutSec: Long): Boolean {
+        return try {
+            val probe = ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
+            val finished = probe.waitFor(timeoutSec, TimeUnit.SECONDS)
+            if (!finished) {
+                probe.destroy()
+                false
+            } else {
+                probe.exitValue() == 0
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun ensureForeground() {
+        if (!notificationStarted) {
+            startForeground(NOTIFICATION_ID, buildNotification())
+            notificationStarted = true
+        } else {
+            refreshNotification()
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        ensureNotificationChannel()
+        val openIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, TunnelService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val state = runtimeState.value
+        val contentText = state.statusMessage.ifBlank { "正在后台维持 Tunnel 可用性" }
+
+        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
+            .setContentIntent(openIntent)
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_media_pause, getString(R.string.disconnect), stopIntent)
+            .build()
+    }
+
+    private fun refreshNotification() {
+        if (!notificationStarted) {
+            return
+        }
+        notificationManager.notify(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun ensureNotificationChannel() {
+        if (notificationManager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) != null) {
+            return
+        }
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            getString(R.string.notification_channel),
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = getString(R.string.notification_channel_description)
+        }
+        notificationManager.createNotificationChannel(channel)
     }
 
     private fun appendLog(message: String) {
@@ -276,100 +696,138 @@ class TunnelService : Service() {
         if (trimmed.isEmpty()) {
             return
         }
-        val safeLine = if (trimmed.length > MAX_LOG_LINE_LENGTH) {
-            trimmed.take(MAX_LOG_LINE_LENGTH) + "…"
-        } else {
-            trimmed
+
+        val safeLine = trimmed.take(MAX_LOG_LINE_LENGTH)
+        val timestamp = DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.CHINA)
+            .format(Date())
+        val combined = "$timestamp  $safeLine"
+
+        updateRuntimeState {
+            val nextLogs = (it.logs + combined).takeLast(MAX_LOG_LINES)
+            it.copy(logs = nextLogs)
         }
-        val snapshot = synchronized(logBuffer) {
-            logBuffer.addLast(safeLine)
-            while (logBuffer.size > MAX_LOG_LINES) {
-                logBuffer.removeFirst()
-            }
-            logBuffer.joinToString("\n")
-        }
-        val intent = Intent(ACTION_LOG).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_LOGS, snapshot)
-        }
-        sendBroadcast(intent)
+        refreshNotification()
     }
 
-    private fun buildNotification(): Notification {
-        ensureNotificationChannel()
-        val intent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE
+    private fun updateRuntimeState(transform: (TunnelRuntimeState) -> TunnelRuntimeState) {
+        _runtimeState.update(transform)
+    }
+
+    private fun resetRuntimeState() {
+        _runtimeState.value = TunnelRuntimeState(
+            desiredRunning = TunnelPreferences.readDesiredRunning(this),
+            status = TunnelStatus.STOPPED,
+            statusMessage = if (TunnelPreferences.readDesiredRunning(this)) {
+                "等待守护恢复"
+            } else {
+                "待命中"
+            },
+            logs = emptyList(),
         )
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.notification_running))
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
     }
 
-    private fun ensureNotificationChannel() {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                getString(R.string.notification_channel),
-                NotificationManager.IMPORTANCE_LOW
-            )
-            manager.createNotificationChannel(channel)
+    private fun scheduleServiceWakeup(delayMs: Long, reason: String) {
+        val intent = Intent(this, TunnelService::class.java).apply {
+            action = ACTION_ENSURE
+            putExtra(EXTRA_REASON, reason)
         }
+        val pendingIntent = PendingIntent.getForegroundService(
+            this,
+            2,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        alarmManager.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + delayMs,
+            pendingIntent,
+        )
     }
 
-    private fun readSavedToken(): String {
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        return prefs.getString(KEY_TOKEN, "") ?: ""
-    }
+    data class HealthResult(
+        val ready: Boolean,
+        val readyConnections: Int,
+        val summary: String,
+    )
 
     companion object {
-        const val PREFS_NAME = "droid_tunnel"
-        const val KEY_TOKEN = "token"
         private const val ACTION_START = "com.anonymous.droidtunnel.START"
         private const val ACTION_STOP = "com.anonymous.droidtunnel.STOP"
+        private const val ACTION_ENSURE = "com.anonymous.droidtunnel.ENSURE"
         private const val EXTRA_TOKEN = "extra_token"
-        const val ACTION_LOG = "com.anonymous.droidtunnel.LOG"
-        const val EXTRA_LOGS = "extra_logs"
-        private const val NOTIFICATION_CHANNEL_ID = "tunnel"
+        private const val EXTRA_REASON = "extra_reason"
+        private const val NOTIFICATION_CHANNEL_ID = "tunnel_guard"
         private const val NOTIFICATION_ID = 1001
         private const val NATIVE_BINARY_NAME = "libcloudflared.so"
-        private const val MAX_LOG_LINES = 200
-        private const val MAX_LOG_LINE_LENGTH = 500
-        private const val RESTART_DELAY_MS = 2000L
-        private const val MIN_RESTART_INTERVAL_MS = 5000L
-        private val logBuffer: ArrayDeque<String> = ArrayDeque()
+        private const val METRICS_PORT = 45000
+        private const val METRICS_ENDPOINT = "127.0.0.1:$METRICS_PORT"
+        private const val READY_URL = "http://$METRICS_ENDPOINT/ready"
+        private const val IPV6_PROBE_HOST = "region1.v2.argotunnel.com"
+        private const val MAX_LOG_LINES = 240
+        private const val MAX_LOG_LINE_LENGTH = 600
+        private const val MIN_BINARY_SIZE_BYTES = 1_000_000L
+        private const val HEALTH_STARTUP_GRACE_MS = 15_000L
+        private const val HEALTHY_PROBE_INTERVAL_MS = 12_000L
+        private const val DEGRADED_PROBE_INTERVAL_MS = 4_000L
+        private const val MAX_CONSECUTIVE_PROBE_FAILURES = 3
+        private const val MAX_PROCESS_SILENCE_MS = 90_000L
+        private const val NETWORK_EVENT_DEBOUNCE_MS = 2_500L
 
-        @Volatile
-        var isRunning: Boolean = false
-            private set
+        private val _runtimeState = MutableStateFlow(TunnelRuntimeState())
+        val runtimeState: StateFlow<TunnelRuntimeState> = _runtimeState.asStateFlow()
 
         fun start(context: Context, token: String) {
+            TunnelPreferences.saveToken(context, token)
+            TunnelPreferences.setDesiredRunning(context, true)
             val intent = Intent(context, TunnelService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_TOKEN, token)
+                putExtra(EXTRA_REASON, "用户点击连接")
             }
-            ContextCompat.startForegroundService(context, intent)
+            startForegroundServiceSafely(context, intent)
+        }
+
+        fun ensureRunning(context: Context, reason: String) {
+            if (TunnelPreferences.readToken(context).isBlank()) {
+                return
+            }
+            TunnelPreferences.setDesiredRunning(context, true)
+            val intent = Intent(context, TunnelService::class.java).apply {
+                action = ACTION_ENSURE
+                putExtra(EXTRA_REASON, reason)
+            }
+            startForegroundServiceSafely(context, intent)
         }
 
         fun stop(context: Context) {
+            TunnelPreferences.setDesiredRunning(context, false)
             val intent = Intent(context, TunnelService::class.java).apply {
                 action = ACTION_STOP
             }
             context.startService(intent)
         }
 
-        fun getLogSnapshot(): String {
-            synchronized(logBuffer) {
-                return logBuffer.joinToString("\n")
+        private fun startForegroundServiceSafely(context: Context, intent: Intent) {
+            runCatching {
+                ContextCompat.startForegroundService(context, intent)
+            }.onFailure {
+                scheduleFallbackWakeup(context, intent)
             }
+        }
+
+        private fun scheduleFallbackWakeup(context: Context, intent: Intent) {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val pendingIntent = PendingIntent.getForegroundService(
+                context,
+                9,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            alarmManager.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 15_000L,
+                pendingIntent,
+            )
         }
     }
 }
