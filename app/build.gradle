@@ -36,6 +36,9 @@ android {
     }
 
     packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
         doNotStrip "*/arm64-v8a/libcloudflared.so"
         doNotStrip "*/armeabi-v7a/libcloudflared.so"
     }

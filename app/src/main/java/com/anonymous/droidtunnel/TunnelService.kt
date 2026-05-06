@@ -86,7 +86,8 @@ class TunnelService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_ENSURE
+        val requestIntent = intent ?: Intent()
+        val action = requestIntent.action ?: ACTION_ENSURE
         when (action) {
             ACTION_STOP -> {
                 handleUserStop()
@@ -96,7 +97,7 @@ class TunnelService : Service() {
             ACTION_START,
             ACTION_ENSURE,
             -> {
-                val explicitToken = intent.getStringExtra(EXTRA_TOKEN).orEmpty().trim()
+                val explicitToken = requestIntent.getStringExtra(EXTRA_TOKEN).orEmpty().trim()
                 if (explicitToken.isNotBlank()) {
                     TunnelPreferences.saveToken(this, explicitToken)
                     TunnelPreferences.setDesiredRunning(this, true)
@@ -104,7 +105,7 @@ class TunnelService : Service() {
                 ensureForeground()
                 serviceScope.launch {
                     ensureTunnelRunning(
-                        reason = intent.getStringExtra(EXTRA_REASON).orEmpty().ifBlank {
+                        reason = requestIntent.getStringExtra(EXTRA_REASON).orEmpty().ifBlank {
                             if (action == ACTION_START) "用户请求启动" else "守护唤醒"
                         },
                     )
@@ -311,10 +312,10 @@ class TunnelService : Service() {
         }
     }
 
-    private fun startExitWatcher(generation: Long, process: Process) {
+    private fun startExitWatcher(generation: Long, runningProcess: Process) {
         exitWatcherJob?.cancel()
         exitWatcherJob = serviceScope.launch {
-            val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
+            val exitCode = runCatching { runningProcess.waitFor() }.getOrDefault(-1)
             if (generation != processGeneration) {
                 return@launch
             }
@@ -339,7 +340,7 @@ class TunnelService : Service() {
             }
             refreshNotification()
             processMutex.withLock {
-                process = null
+                this@TunnelService.process = null
                 logJob?.cancel()
                 healthJob?.cancel()
                 if (TunnelPreferences.readDesiredRunning(this@TunnelService)) {
