@@ -283,6 +283,16 @@ class TunnelService : Service() {
             "http2",
         )
 
+        val customDnsResolvers = buildCloudflaredDnsResolverAddrs()
+        if (customDnsResolvers.isNotEmpty()) {
+            appendLog("为 cloudflared 指定 DNS 解析器：${customDnsResolvers.joinToString()}")
+            customDnsResolvers.forEach { resolver ->
+                args += listOf("--dns-resolver-addrs", resolver)
+            }
+        } else {
+            appendLog("未能为 cloudflared 发现可用的直连 DNS 解析器，继续使用系统默认解析")
+        }
+
         val ipv6Probe = probeRegion1Ipv6Connectivity()
         if (ipv6Probe.reachable) {
             appendLog(
@@ -615,6 +625,25 @@ class TunnelService : Service() {
             HealthResult(false, 0, e.message.orEmpty().ifBlank { "readiness 检查失败" })
         } finally {
             connection.disconnect()
+        }
+    }
+
+    private fun buildCloudflaredDnsResolverAddrs(): List<String> {
+        val activeNetwork = connectivityManager.activeNetwork ?: return emptyList()
+        val linkProperties = connectivityManager.getLinkProperties(activeNetwork) ?: return emptyList()
+
+        return linkProperties.dnsServers
+            .filterNot { it.isLoopbackAddress || it.isAnyLocalAddress }
+            .distinctBy { it.hostAddress }
+            .map { formatDnsResolverAddr(it) }
+    }
+
+    private fun formatDnsResolverAddr(address: InetAddress): String {
+        val host = address.hostAddress ?: address.toString()
+        return if (address is Inet6Address) {
+            "[$host]:$DNS_SERVER_PORT"
+        } else {
+            "$host:$DNS_SERVER_PORT"
         }
     }
 
