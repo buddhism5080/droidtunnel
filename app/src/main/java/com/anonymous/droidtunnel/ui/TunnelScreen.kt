@@ -10,8 +10,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.item
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -77,40 +79,56 @@ fun TunnelScreen(
                 },
             )
         },
+        bottomBar = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .imePadding()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                ControlCard(
+                    runtime = state.runtime,
+                    hasToken = state.token.isNotBlank(),
+                    onConnectClicked = onConnectClicked,
+                    onDisconnectClicked = onDisconnectClicked,
+                )
+            }
+        },
     ) { innerPadding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            StatusOverviewCard(runtime = state.runtime)
+            item {
+                StatusOverviewCard(runtime = state.runtime)
+            }
 
-            TokenCard(
-                token = state.token,
-                showTokenEditor = state.showTokenEditor,
-                onTokenChanged = onTokenChanged,
-                onEditTokenClicked = onEditTokenClicked,
-                onHideTokenEditorClicked = onHideTokenEditorClicked,
-            )
+            item {
+                TokenCard(
+                    token = state.token,
+                    showTokenEditor = state.showTokenEditor,
+                    onTokenChanged = onTokenChanged,
+                    onEditTokenClicked = onEditTokenClicked,
+                    onHideTokenEditorClicked = onHideTokenEditorClicked,
+                )
+            }
 
-            ControlCard(
-                runtime = state.runtime,
-                hasToken = state.token.isNotBlank(),
-                onConnectClicked = onConnectClicked,
-                onDisconnectClicked = onDisconnectClicked,
-            )
+            item {
+                ProtectionCard(
+                    batteryOptimizationRecommended = state.batteryOptimizationRecommended,
+                    onRequestBatteryOptimizationClicked = onRequestBatteryOptimizationClicked,
+                )
+            }
 
-            ProtectionCard(
-                batteryOptimizationRecommended = state.batteryOptimizationRecommended,
-                onRequestBatteryOptimizationClicked = onRequestBatteryOptimizationClicked,
-            )
-
-            LogsCard(
-                modifier = Modifier.weight(1f),
-                logs = state.runtime.logs,
-            )
+            item {
+                LogsCard(
+                    modifier = Modifier.height(240.dp),
+                    logs = state.runtime.logs,
+                )
+            }
         }
     }
 }
