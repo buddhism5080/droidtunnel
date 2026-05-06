@@ -384,11 +384,11 @@ class TunnelService : Service() {
                     return@launch
                 }
 
-                val probeFailures = runtimeState.value.consecutiveProbeFailures
-                val interval = if (probeFailures == 0) {
-                    HEALTHY_PROBE_INTERVAL_MS
-                } else {
-                    DEGRADED_PROBE_INTERVAL_MS
+                val runtime = runtimeState.value
+                val interval = when {
+                    runtime.status == TunnelStatus.STARTING -> STARTING_PROBE_INTERVAL_MS
+                    runtime.consecutiveProbeFailures == 0 -> HEALTHY_PROBE_INTERVAL_MS
+                    else -> DEGRADED_PROBE_INTERVAL_MS
                 }
                 delay(interval)
             }
@@ -421,17 +421,28 @@ class TunnelService : Service() {
             return true
         }
 
-        val newFailures = runtimeState.value.consecutiveProbeFailures + 1
+        val assessment = TunnelHealthMonitor.assessNotReady(
+            summary = result.summary,
+            previousFailures = runtimeState.value.consecutiveProbeFailures,
+            now = now,
+            lastStartedAtMillis = runtimeState.value.lastStartedAtMillis,
+            lastHealthyAtMillis = runtimeState.value.lastHealthyAtMillis,
+        )
+        val newFailures = assessment.consecutiveProbeFailures
         updateRuntimeState {
             it.copy(
                 desiredRunning = true,
-                status = TunnelStatus.DEGRADED,
-                statusMessage = "健康检查失败：${result.summary}",
-                readyConnections = 0,
+                status = assessment.status,
+                statusMessage = assessment.statusMessage,
+                readyConnections = result.readyConnections,
                 consecutiveProbeFailures = newFailures,
             )
         }
         refreshNotification()
+
+        if (assessment.status == TunnelStatus.STARTING) {
+            return true
+        }
 
         if (newFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) {
             appendLog("连续 $newFailures 次健康检查失败，准备重启隧道")
@@ -612,10 +623,12 @@ class TunnelService : Service() {
             } else {
                 connection.errorStream
             })?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val json = responseBody.takeIf { it.isNotBlank() }?.let {
+                runCatching { JSONObject(it) }.getOrNull()
+            }
+            val readyConnections = json?.optInt("readyConnections", 0) ?: 0
 
             if (statusCode == HttpURLConnection.HTTP_OK) {
-                val json = JSONObject(responseBody)
-                val readyConnections = json.optInt("readyConnections", 0)
                 val ready = readyConnections > 0
                 if (ready) {
                     HealthResult(true, readyConnections, "readyConnections=$readyConnections")
@@ -623,10 +636,16 @@ class TunnelService : Service() {
                     HealthResult(false, readyConnections, "readyConnections=0")
                 }
             } else {
-                HealthResult(false, 0, "HTTP $statusCode")
+                val suffix = if (readyConnections > 0 || responseBody.isNotBlank()) {
+                    "，readyConnections=$readyConnections"
+                } else {
+                    ""
+                }
+                HealthResult(false, readyConnections, "HTTP $statusCode$suffix")
             }
         } catch (e: Exception) {
-            HealthResult(false, 0, e.message.orEmpty().ifBlank { "readiness 检查失败" })
+            val detail = e.message.orEmpty().ifBlank { "readiness 检查失败" }
+            HealthResult(false, 0, "$METRICS_ENDPOINT 不可达：$detail")
         } finally {
             connection.disconnect()
         }
@@ -1035,6 +1054,7 @@ class TunnelService : Service() {
         private const val MAX_LOG_LINE_LENGTH = 600
         private const val MIN_BINARY_SIZE_BYTES = 1_000_000L
         private const val HEALTH_STARTUP_GRACE_MS = 15_000L
+        private const val STARTING_PROBE_INTERVAL_MS = 4_000L
         private const val HEALTHY_PROBE_INTERVAL_MS = 12_000L
         private const val DEGRADED_PROBE_INTERVAL_MS = 4_000L
         private const val MAX_CONSECUTIVE_PROBE_FAILURES = 3
