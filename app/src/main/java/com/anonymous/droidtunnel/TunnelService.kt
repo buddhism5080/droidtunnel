@@ -30,9 +30,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URL
 import java.text.DateFormat
 import java.util.Date
@@ -276,11 +283,14 @@ class TunnelService : Service() {
             "http2",
         )
 
-        if (canPingRegion1OverIpv6()) {
-            appendLog("IPv6 探测通过，优先使用 IPv6 Edge")
+        val ipv6Probe = probeRegion1Ipv6Connectivity()
+        if (ipv6Probe.reachable) {
+            appendLog(
+                "IPv6 直连探测通过：DNS ${ipv6Probe.dnsServer} -> ${ipv6Probe.address}:$ARGO_EDGE_PORT，优先使用 IPv6 Edge",
+            )
             args += listOf("--edge-ip-version", "6")
         } else {
-            appendLog("IPv6 不可达，保持 cloudflared 默认 Edge 策略")
+            appendLog("IPv6 直连探测未通过：${ipv6Probe.summary}，保持 cloudflared 默认 Edge 策略")
         }
 
         args += listOf(
@@ -608,30 +618,240 @@ class TunnelService : Service() {
         }
     }
 
-    private fun canPingRegion1OverIpv6(): Boolean {
-        val candidates = listOf(
-            listOf("ping6", "-c", "1", IPV6_PROBE_HOST),
-            listOf("ping", "-6", "-c", "1", IPV6_PROBE_HOST),
-        )
+    private fun probeRegion1Ipv6Connectivity(): Ipv6ProbeResult {
+        val activeNetwork = connectivityManager.activeNetwork
+            ?: return Ipv6ProbeResult(reachable = false, summary = "当前没有活动网络")
+        val linkProperties = connectivityManager.getLinkProperties(activeNetwork)
+            ?: return Ipv6ProbeResult(reachable = false, summary = "无法读取当前网络属性")
+        val dnsServers = linkProperties.dnsServers
+            .filterNot { it.isLoopbackAddress || it.isAnyLocalAddress }
+            .distinctBy { it.hostAddress }
 
-        return candidates.any { command -> runProbeCommand(command, 2L) }
+        if (dnsServers.isEmpty()) {
+            return Ipv6ProbeResult(
+                reachable = false,
+                summary = "当前网络没有可直连的 DNS 服务器（已过滤回环地址）",
+            )
+        }
+
+        val failureReasons = mutableListOf<String>()
+        for (dnsServer in dnsServers) {
+            val ipv6Answers = try {
+                queryAaaaRecords(
+                    network = activeNetwork,
+                    dnsServer = dnsServer,
+                    hostname = IPV6_PROBE_HOST,
+                )
+            } catch (e: IOException) {
+                failureReasons += "DNS ${dnsServer.hostAddress} 解析失败：${e.message.orEmpty().ifBlank { "未知错误" }}"
+                continue
+            }
+
+            if (ipv6Answers.isEmpty()) {
+                failureReasons += "DNS ${dnsServer.hostAddress} 未返回 $IPV6_PROBE_HOST 的 AAAA 记录"
+                continue
+            }
+
+            for (ipv6Address in ipv6Answers) {
+                if (canConnectToEdgeOverIpv6(activeNetwork, ipv6Address, ARGO_EDGE_PORT)) {
+                    return Ipv6ProbeResult(
+                        reachable = true,
+                        dnsServer = dnsServer.hostAddress,
+                        address = ipv6Address.hostAddress,
+                        summary = "通过 ${dnsServer.hostAddress} 成功命中 ${ipv6Address.hostAddress}",
+                    )
+                }
+            }
+
+            failureReasons += "DNS ${dnsServer.hostAddress} 返回 ${ipv6Answers.size} 个 AAAA，但 $ARGO_EDGE_PORT 端口均不可达"
+        }
+
+        return Ipv6ProbeResult(
+            reachable = false,
+            summary = failureReasons.joinToString(separator = "；").take(260).ifBlank {
+                "未解析到可用的 IPv6 Edge"
+            },
+        )
     }
 
-    private fun runProbeCommand(command: List<String>, timeoutSec: Long): Boolean {
-        return try {
-            val probe = ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .start()
-            val finished = probe.waitFor(timeoutSec, TimeUnit.SECONDS)
-            if (!finished) {
-                probe.destroy()
-                false
-            } else {
-                probe.exitValue() == 0
+    private fun queryAaaaRecords(
+        network: Network,
+        dnsServer: InetAddress,
+        hostname: String,
+    ): List<Inet6Address> {
+        val queryId = Random.nextInt(0, 0x10000)
+        val queryPacket = buildDnsQuery(
+            hostname = hostname,
+            queryId = queryId,
+            queryType = DNS_TYPE_AAAA,
+        )
+        val responseBuffer = ByteArray(DNS_RESPONSE_BUFFER_BYTES)
+
+        DatagramSocket().use { socket ->
+            network.bindSocket(socket)
+            socket.soTimeout = DNS_QUERY_TIMEOUT_MS.toInt()
+            socket.connect(dnsServer, DNS_SERVER_PORT)
+            val request = DatagramPacket(queryPacket, queryPacket.size)
+            socket.send(request)
+
+            val response = DatagramPacket(responseBuffer, responseBuffer.size)
+            socket.receive(response)
+            return parseAaaaAnswers(
+                payload = response.data,
+                length = response.length,
+                expectedQueryId = queryId,
+            )
+        }
+    }
+
+    private fun buildDnsQuery(
+        hostname: String,
+        queryId: Int,
+        queryType: Int,
+    ): ByteArray {
+        val labels = hostname.trim('.').split('.').filter { it.isNotBlank() }
+        if (labels.isEmpty()) {
+            throw IOException("DNS 查询域名为空")
+        }
+
+        return ByteArrayOutputStream().apply {
+            writeUnsignedShort(this, queryId)
+            writeUnsignedShort(this, 0x0100)
+            writeUnsignedShort(this, 1)
+            writeUnsignedShort(this, 0)
+            writeUnsignedShort(this, 0)
+            writeUnsignedShort(this, 0)
+
+            labels.forEach { label ->
+                val labelBytes = label.toByteArray(Charsets.UTF_8)
+                if (labelBytes.isEmpty() || labelBytes.size > 63) {
+                    throw IOException("非法 DNS label：$label")
+                }
+                write(labelBytes.size)
+                write(labelBytes)
             }
-        } catch (_: Exception) {
+            write(0)
+            writeUnsignedShort(this, queryType)
+            writeUnsignedShort(this, DNS_CLASS_IN)
+        }.toByteArray()
+    }
+
+    private fun parseAaaaAnswers(
+        payload: ByteArray,
+        length: Int,
+        expectedQueryId: Int,
+    ): List<Inet6Address> {
+        if (length < DNS_HEADER_LENGTH) {
+            throw IOException("DNS 响应过短")
+        }
+
+        val responseId = readUnsignedShort(payload, 0)
+        if (responseId != expectedQueryId) {
+            throw IOException("DNS 响应 ID 不匹配")
+        }
+
+        val flags = readUnsignedShort(payload, 2)
+        val rCode = flags and 0x000F
+        if (rCode != 0) {
+            throw IOException("DNS 响应错误，rcode=$rCode")
+        }
+
+        val questionCount = readUnsignedShort(payload, 4)
+        val answerCount = readUnsignedShort(payload, 6)
+        var offset = DNS_HEADER_LENGTH
+
+        repeat(questionCount) {
+            offset = skipDnsName(payload, length, offset)
+            if (offset + 4 > length) {
+                throw IOException("DNS question 区域截断")
+            }
+            offset += 4
+        }
+
+        val answers = linkedSetOf<Inet6Address>()
+        repeat(answerCount) {
+            offset = skipDnsName(payload, length, offset)
+            if (offset + 10 > length) {
+                throw IOException("DNS answer 区域截断")
+            }
+
+            val type = readUnsignedShort(payload, offset)
+            val clazz = readUnsignedShort(payload, offset + 2)
+            val rdLength = readUnsignedShort(payload, offset + 8)
+            offset += 10
+
+            if (offset + rdLength > length) {
+                throw IOException("DNS RDATA 截断")
+            }
+
+            if (type == DNS_TYPE_AAAA && clazz == DNS_CLASS_IN && rdLength == 16) {
+                val addressBytes = payload.copyOfRange(offset, offset + rdLength)
+                val address = InetAddress.getByAddress(addressBytes)
+                if (address is Inet6Address) {
+                    answers += address
+                }
+            }
+            offset += rdLength
+        }
+
+        return answers.toList()
+    }
+
+    private fun skipDnsName(
+        payload: ByteArray,
+        length: Int,
+        startOffset: Int,
+    ): Int {
+        var offset = startOffset
+        var steps = 0
+        while (offset < length) {
+            if (++steps > 128) {
+                throw IOException("DNS 名称跳转过深")
+            }
+            val marker = payload[offset].toInt() and 0xFF
+            when {
+                marker == 0 -> return offset + 1
+                marker and 0xC0 == 0xC0 -> {
+                    if (offset + 1 >= length) {
+                        throw IOException("DNS 压缩指针截断")
+                    }
+                    return offset + 2
+                }
+                else -> {
+                    offset += 1
+                    if (offset + marker > length) {
+                        throw IOException("DNS label 越界")
+                    }
+                    offset += marker
+                }
+            }
+        }
+        throw IOException("DNS 名称解析越界")
+    }
+
+    private fun canConnectToEdgeOverIpv6(
+        network: Network,
+        address: Inet6Address,
+        port: Int,
+    ): Boolean {
+        return try {
+            Socket().use { socket ->
+                network.bindSocket(socket)
+                socket.connect(InetSocketAddress(address, port), IPV6_CONNECT_TIMEOUT_MS.toInt())
+                true
+            }
+        } catch (_: IOException) {
             false
         }
+    }
+
+    private fun writeUnsignedShort(output: ByteArrayOutputStream, value: Int) {
+        output.write((value ushr 8) and 0xFF)
+        output.write(value and 0xFF)
+    }
+
+    private fun readUnsignedShort(payload: ByteArray, offset: Int): Int {
+        return ((payload[offset].toInt() and 0xFF) shl 8) or (payload[offset + 1].toInt() and 0xFF)
     }
 
     private fun ensureForeground() {
@@ -751,6 +971,13 @@ class TunnelService : Service() {
         val summary: String,
     )
 
+    data class Ipv6ProbeResult(
+        val reachable: Boolean,
+        val dnsServer: String? = null,
+        val address: String? = null,
+        val summary: String,
+    )
+
     companion object {
         private const val ACTION_START = "com.anonymous.droidtunnel.START"
         private const val ACTION_STOP = "com.anonymous.droidtunnel.STOP"
@@ -764,6 +991,14 @@ class TunnelService : Service() {
         private const val METRICS_ENDPOINT = "127.0.0.1:$METRICS_PORT"
         private const val READY_URL = "http://$METRICS_ENDPOINT/ready"
         private const val IPV6_PROBE_HOST = "region1.v2.argotunnel.com"
+        private const val ARGO_EDGE_PORT = 7844
+        private const val DNS_SERVER_PORT = 53
+        private const val DNS_HEADER_LENGTH = 12
+        private const val DNS_CLASS_IN = 1
+        private const val DNS_TYPE_AAAA = 28
+        private const val DNS_QUERY_TIMEOUT_MS = 2_000L
+        private const val DNS_RESPONSE_BUFFER_BYTES = 1500
+        private const val IPV6_CONNECT_TIMEOUT_MS = 2_000L
         private const val MAX_LOG_LINES = 240
         private const val MAX_LOG_LINE_LENGTH = 600
         private const val MIN_BINARY_SIZE_BYTES = 1_000_000L
