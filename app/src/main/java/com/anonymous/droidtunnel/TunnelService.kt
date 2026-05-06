@@ -633,13 +633,12 @@ class TunnelService : Service() {
     }
 
     private fun buildCloudflaredDnsResolverAddrs(): List<String> {
-        val activeNetwork = connectivityManager.activeNetwork ?: return emptyList()
-        val linkProperties = connectivityManager.getLinkProperties(activeNetwork) ?: return emptyList()
-
-        return linkProperties.dnsServers
-            .filterNot { it.isLoopbackAddress || it.isAnyLocalAddress }
-            .distinctBy { it.hostAddress }
-            .map { formatDnsResolverAddr(it) }
+        return listOf(
+            "1.1.1.1:$DNS_SERVER_PORT",
+            "1.0.0.1:$DNS_SERVER_PORT",
+            "[2606:4700:4700::1111]:$DNS_SERVER_PORT",
+            "[2606:4700:4700::1001]:$DNS_SERVER_PORT",
+        )
     }
 
     private fun formatDnsResolverAddr(address: InetAddress): String {
