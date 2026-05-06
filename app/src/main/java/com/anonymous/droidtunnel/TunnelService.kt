@@ -286,9 +286,6 @@ class TunnelService : Service() {
         val customDnsResolvers = buildCloudflaredDnsResolverAddrs()
         if (customDnsResolvers.isNotEmpty()) {
             appendLog("为 cloudflared 指定 DNS 解析器：${customDnsResolvers.joinToString()}")
-            customDnsResolvers.forEach { resolver ->
-                args += listOf("--dns-resolver-addrs", resolver)
-            }
         } else {
             appendLog("未能为 cloudflared 发现可用的直连 DNS 解析器，继续使用系统默认解析")
         }
@@ -307,6 +304,13 @@ class TunnelService : Service() {
             "--metrics",
             METRICS_ENDPOINT,
             "run",
+        )
+        if (customDnsResolvers.isNotEmpty()) {
+            customDnsResolvers.forEach { resolver ->
+                args += listOf("--dns-resolver-addrs", resolver)
+            }
+        }
+        args += listOf(
             "--token",
             token,
         )
